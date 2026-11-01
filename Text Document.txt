@@ -1,0 +1,1856 @@
+
+ПРИЛОЖЕНИЕ «БЛАНК И ТАХО» — ИСХОДНЫЙ КОД
+==========================================
+
+Что это: приложение заполняет бланк «Spesen und Arbeitszeiten» и листы «Tageskontrollblatt»
+(тахограф, 4 дня на лист) по месяцам и собирает всё в один PDF. Работает без сервера и без
+интернета: данные хранятся в localStorage, PDF рисуется на canvas в браузере.
+
+Стек: React 19 + TypeScript, react-router-dom 7, @tanstack/react-table 8, lucide-react, Tailwind CSS 4.
+
+Правила, которые заложены в расчёт:
+- Бланк: старт 5:30–8:00 (шаг 30 мин), Netto Arb.Zeit = Fahrzeit + 1 час, пауза 1 час,
+  часы вождения за месяц делятся по рабочим дням (не больше 9 ч в день), Spesen 14 € (пн, пт) или 28 €.
+- Tacho: день из клеток по 15 минут. Строка 1 — вождение, 2 — отдых и перерывы, 3 — прочая работа.
+  День начинается и заканчивается ездой (сначала 15/30/60 минут, потом работа). Редко (1 день из 8)
+  начинается или заканчивается работой. Вождение делится на 2–3 периода.
+  Вождение без перерыва не больше 4:30. Перерыв: 45 минут или 15 + 30. Вождение в день не больше 10 ч.
+  Выходной = весь день отдых, пробег 0. Пробег за месяц = конечный километраж − начальный,
+  делится по дням, одинаковых чисел нет.
+
+Как собрать: создайте Vite-проект React + TypeScript, положите файлы по путям ниже
+(client/lib/..., client/pages/..., client/App.tsx).
+
+ВАЖНО: компоненты интерфейса из папки client/components (Button, Card, Input, Label, Select,
+DataTable, Stat, Badge, DetailList, Dialog, PageHeader, Nav, Toast) принадлежат платформе Glide и
+здесь не приведены. Это обычные кнопки, поля, таблицы и диалоги: замените их своими или
+библиотекой (например, shadcn/ui). Вся логика находится в client/lib и от них не зависит.
+Файл client/lib/offline.ts и server.ts нужны только для режима без интернета (service worker).
+
+Файлы:
+ 1. client/lib/blank.ts          — расчёт бланка Spesen
+ 2. client/lib/tacho.ts          — расчёт листов Tacho
+ 3. client/lib/tachoDraw.ts      — рисование листов Tacho и PDF из нескольких страниц
+ 4. client/lib/pdf.ts            — рисование бланка Spesen и скачивание файла
+ 5. client/lib/combinedPdf.ts    — один PDF: бланк + Tacho
+ 6. client/lib/useBlankForm.ts   — общее состояние (localStorage)
+ 7. client/lib/EditCell.tsx      — редактируемые ячейки бланка
+ 8. client/lib/ClearButton.tsx   — кнопка «Очистить всё»
+ 9. client/lib/offline.ts        — работа без интернета
+10. client/pages/Generator.tsx   — страница «Бланк»
+11. client/pages/Tacho.tsx       — страница «Tacho»
+12. client/App.tsx               — меню и маршруты
+13. server.ts                    — service worker (работа без интернета)
+
+
+==========================================================================
+FILE: client/lib/blank.ts
+==========================================================================
+// Расчёт бланка «Spesen und Arbeitszeiten» по правилам пользователя.
+
+// Ручные правки одного дня. Всё, чего здесь нет, считается автоматически.
+export interface DayEdit {
+  von?: number; // минуты от полуночи
+  drive?: number; // Netto Fahrzeit, ч
+  pause?: number; // Pause, ч
+  zeit?: string;
+  spesen?: string;
+  start?: string;
+}
+
+export interface BlankInput {
+  name: string;
+  plate: string;
+  year: string; // YYYY
+  monthNum: string; // "01".."12"
+  monthDrive: string; // сумма Netto Fahrzeit за месяц, ч
+  seed: number; // меняется кнопкой «Перемешать»
+  startZip: string; // индекс старта первого дня
+  stops: Record<string, string>; // индекс конца дня (Stop) по дате YYYY-MM-DD
+  off: Record<string, boolean>; // будний день, сделанный нерабочим
+  on: Record<string, boolean>; // выходной (сб, вс), на который выходят работать
+  edits: Record<string, DayEdit>; // ручные правки по дате
+  odoStart: string; // километраж на начало месяца (Tageskontrollblatt)
+  odoEnd: string; // километраж на конец месяца
+}
+
+export interface BlankRow {
+  iso: string;
+  day: number;
+  weekday: number; // 0 = воскресенье
+  work: boolean;
+  edited: boolean;
+  vonMin: number;
+  driveH: number;
+  pauseH: number;
+  von: string;
+  bis: string;
+  zeit: string;
+  spesen: string;
+  start: string;
+  stop: string;
+  pvon: string;
+  pause: string;
+  pbis: string;
+  arb: string;
+  fahr: string;
+}
+
+export interface BlankTotals {
+  spesen: number;
+  arb: number;
+  fahr: number;
+}
+
+export type FieldKey =
+  | "von" | "bis" | "zeit" | "spesen" | "start" | "stop"
+  | "pvon" | "pause" | "pbis" | "arb" | "fahr";
+
+export const WEEKDAYS_RU = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"];
+export const MONTHS_RU = [
+  "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+];
+export const MONTHS_DE = [
+  "Januar", "Februar", "März", "April", "Mai", "Juni",
+  "Juli", "August", "September", "Oktober", "November", "Dezember",
+];
+
+export function parseHours(s: string): number {
+  const t = s.trim().replace(",", ".");
+  if (!t) return 0;
+  if (t.includes(":")) {
+    const [h, m] = t.split(":");
+    const v = Number(h) + Number(m || 0) / 60;
+    return Number.isFinite(v) ? v : 0;
+  }
+  const v = Number(t);
+  return Number.isFinite(v) ? v : 0;
+}
+
+// "6:30", "06.30", "630" → минуты; иначе null
+function parseTime(s: string): number | null {
+  const t = s.trim();
+  let h: number;
+  let m: number;
+  const a = /^(\d{1,2})[:.,](\d{2})$/.exec(t);
+  const b = /^(\d{1,2})(\d{2})$/.exec(t);
+  if (a) [h, m] = [Number(a[1]), Number(a[2])];
+  else if (b) [h, m] = [Number(b[1]), Number(b[2])];
+  else if (/^\d{1,2}$/.test(t)) [h, m] = [Number(t), 0];
+  else return null;
+  if (h > 23 || m > 59) return null;
+  return h * 60 + m;
+}
+
+function fmtTime(minutes: number): string {
+  const t = ((Math.round(minutes) % 1440) + 1440) % 1440;
+  const h = String(Math.floor(t / 60)).padStart(2, "0");
+  const mm = String(t % 60).padStart(2, "0");
+  return `${h}:${mm}`;
+}
+
+export function fmtNum(n: number): string {
+  return String(Math.round(n * 100) / 100).replace(".", ",");
+}
+
+// Часы в формате 7:30, 10:00
+export function fmtHM(hours: number): string {
+  const total = Math.max(0, Math.round(hours * 60));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+// Детерминированный генератор случайных чисел: при одном seed результат одинаковый.
+export function rng(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Делит часы на n рабочих дней: у каждого дня своё значение с шагом
+// в полчаса, вокруг среднего (±1 ч). Сумма сходится точно.
+export function splitDrive(totalHours: number, n: number, seed: number): number[] {
+  if (n <= 0) return [];
+  const units = Math.max(0, Math.round(totalHours * 2)); // полчаса = 1
+  const base = Math.floor(units / n);
+  const u = Array.from({ length: n }, () => base);
+  const rand = rng(seed * 31 + n * 7 + units);
+  const order = Array.from({ length: n }, (_, i) => i).sort(() => rand() - 0.5);
+  for (let k = 0; k < units - base * n; k++) u[order[k]] += 1;
+  const lo = Math.max(0, base - 2);
+  // не больше 9 ч в день: при часовой паузе больше вести по закону нельзя
+  const hi = Math.max(base, Math.min(base + 3, 18));
+  for (let k = 0; k < n * 4; k++) {
+    const i = Math.floor(rand() * n);
+    const j = Math.floor(rand() * n);
+    if (i !== j && u[j] - 1 >= lo && u[i] + 1 <= hi) {
+      u[i] += 1;
+      u[j] -= 1;
+    }
+  }
+  return u.map((x) => x / 2);
+}
+
+// Старт утром: от 5:30 до 8:00 с шагом в полчаса.
+function startMinutes(rand: () => number): number {
+  return 330 + 30 * Math.floor(rand() * 6);
+}
+
+const isoOf = (input: BlankInput, d: number) =>
+  `${input.year}-${input.monthNum}-${String(d).padStart(2, "0")}`;
+
+export function computeBlank(input: BlankInput): { rows: BlankRow[]; totals: BlankTotals } {
+  const y = Number(input.year);
+  const m = Number(input.monthNum);
+  const totals: BlankTotals = { spesen: 0, arb: 0, fahr: 0 };
+  if (!y || !m) return { rows: [], totals };
+
+  const days = new Date(y, m, 0).getDate();
+  const isWork = (d: number) => {
+    const wd = new Date(y, m - 1, d).getDay();
+    const iso = isoOf(input, d);
+    return wd >= 1 && wd <= 5 ? !input.off[iso] : Boolean(input.on?.[iso]);
+  };
+
+  // Часы, заданные вручную, остаются как есть; остаток месяца делится
+  // между остальными рабочими днями.
+  let locked = 0;
+  let free = 0;
+  for (let d = 1; d <= days; d++) {
+    if (!isWork(d)) continue;
+    const e = input.edits[isoOf(input, d)];
+    if (e?.drive !== undefined) locked += e.drive;
+    else free++;
+  }
+  const drives = splitDrive(parseHours(input.monthDrive) - locked, free, input.seed);
+
+  const startRand = rng(input.seed * 17 + 5);
+  let wi = 0;
+  const rows: BlankRow[] = [];
+  let currentZip = input.startZip.trim();
+
+  for (let d = 1; d <= days; d++) {
+    const iso = isoOf(input, d);
+    const weekday = new Date(y, m - 1, d).getDay();
+    const work = isWork(d);
+    // старт тянется для каждого календарного дня: отключение одного дня
+    // не сдвигает время старта у остальных
+    const randomVon = startMinutes(startRand);
+    const edit = input.edits[iso];
+    const row: BlankRow = {
+      iso, day: d, weekday, work,
+      edited: Boolean(edit) || Boolean(input.stops[iso]),
+      vonMin: 0, driveH: 0, pauseH: 0,
+      von: "", bis: "", zeit: "", spesen: "", start: "", stop: "",
+      pvon: "", pause: "", pbis: "", arb: "", fahr: "",
+    };
+    if (work) {
+      const e = edit ?? {};
+      const drive = e.drive ?? drives[wi++];
+      const von = e.von ?? randomVon;
+      const pause = e.pause ?? 1;
+      const arb = drive + 1; // Netto Arb.Zeit = Fahrzeit + 1 час
+      // bis = von + Arb.Zeit + Pause (при Pause 1: von + Fahrzeit + 2 часа)
+      const bis = fmtTime(von + Math.round((arb + pause) * 60));
+      const vonStr = fmtTime(von);
+      const spesen = e.spesen ?? String(weekday === 1 || weekday === 5 ? 14 : 28);
+      const stop = (input.stops[iso] ?? "").trim();
+      row.vonMin = von;
+      row.driveH = drive;
+      row.pauseH = pause;
+      row.von = vonStr;
+      row.bis = bis;
+      row.zeit = e.zeit ?? "24";
+      row.spesen = spesen;
+      row.start = e.start ?? currentZip;
+      row.stop = stop;
+      row.pvon = vonStr; // правый von копируется из левого
+      row.pause = fmtNum(pause);
+      row.pbis = bis;
+      row.arb = fmtHM(arb);
+      row.fahr = fmtHM(drive);
+      if (stop) currentZip = stop; // Stop дня переходит в Start следующего
+      totals.spesen += parseHours(spesen);
+      totals.arb += arb;
+      totals.fahr += drive;
+    }
+    rows.push(row);
+  }
+  return { rows, totals };
+}
+
+// Ручная правка одного поля. Остальные поля дня и остальные дни
+// пересчитываются в computeBlank. Пустое значение возвращает автоматику.
+export function applyEdit(
+  input: BlankInput,
+  row: BlankRow,
+  field: FieldKey,
+  raw: string,
+): BlankInput {
+  if (!row.work) return input;
+  const value = raw.trim();
+  const e: DayEdit = { ...(input.edits[row.iso] ?? {}) };
+  const stops = { ...input.stops };
+
+  switch (field) {
+    case "von":
+    case "pvon": {
+      if (!value) delete e.von;
+      else {
+        const t = parseTime(value);
+        if (t === null) return input;
+        e.von = t;
+      }
+      break;
+    }
+    case "bis":
+    case "pbis": {
+      if (!value) delete e.drive;
+      else {
+        const t = parseTime(value);
+        if (t === null) return input;
+        const span = ((((t - row.vonMin) % 1440) + 1440) % 1440) / 60;
+        e.drive = Math.max(0, Math.round((span - 1 - row.pauseH) * 100) / 100);
+      }
+      break;
+    }
+    case "arb":
+      if (!value) delete e.drive;
+      else e.drive = Math.max(0, parseHours(value) - 1);
+      break;
+    case "fahr":
+      if (!value) delete e.drive;
+      else e.drive = Math.max(0, parseHours(value));
+      break;
+    case "pause":
+      if (!value) delete e.pause;
+      else e.pause = Math.max(0, parseHours(value));
+      break;
+    case "zeit":
+      if (!value) delete e.zeit;
+      else e.zeit = value;
+      break;
+    case "spesen":
+      if (!value) delete e.spesen;
+      else e.spesen = value;
+      break;
+    case "start":
+      if (!value) delete e.start;
+      else e.start = value;
+      break;
+    case "stop":
+      if (!value) delete stops[row.iso];
+      else stops[row.iso] = value;
+      break;
+  }
+
+  const edits = { ...input.edits };
+  if (Object.keys(e).length) edits[row.iso] = e;
+  else delete edits[row.iso];
+  return { ...input, edits, stops };
+}
+
+// Вернуть день к автоматическим значениям.
+export function resetDay(input: BlankInput, iso: string): BlankInput {
+  const edits = { ...input.edits };
+  const stops = { ...input.stops };
+  delete edits[iso];
+  delete stops[iso];
+  return { ...input, edits, stops };
+}
+
+
+==========================================================================
+FILE: client/lib/tacho.ts
+==========================================================================
+import { computeBlank, rng, type BlankInput } from "./blank";
+
+// Tageskontrollblatt: каждый день = 96 клеток по 15 минут.
+// Строка 1 — Lenkzeiten (вождение), 2 — Ruhezeiten/перерывы, 3 — прочая работа.
+export type Kind = "drive" | "rest" | "work";
+
+export const UNITS = 96;
+const MAX_RUN = 18; // 4:30 вождения до обязательного перерыва
+const MAX_DAY_DRIVE = 40; // 10:00 вождения в день
+const WORK_HOUR = 4; // Netto Arb.Zeit = Fahrzeit + 1 час
+
+type Tok = { t: "D" | "P" | "W"; u: number };
+
+export interface TachoDay {
+  iso: string;
+  day: number;
+  weekday: number;
+  work: boolean;
+  dateLabel: string;
+  from: string;
+  to: string;
+  kmStart: string;
+  kmEnd: string;
+  km: number | null; // null — пробег неизвестен (не введён километраж конца месяца)
+  cells: Kind[];
+  vonU: number;
+  endU: number;
+  driveU: number;
+  pauseU: number;
+  drives: number[]; // периоды вождения, в клетках
+  maxRun: number; // самое долгое вождение до перерыва, в клетках
+  warnings: string[];
+}
+
+export interface TachoResult {
+  firstName: string;
+  lastName: string;
+  plate: string;
+  days: TachoDay[];
+  driveU: number;
+  km: number;
+  warningCount: number;
+}
+
+const WD_DE = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+
+export function unitTime(u: number): string {
+  const m = Math.min(1440, u * 15);
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+export function unitHM(u: number): string {
+  const m = u * 15;
+  return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`;
+}
+
+// Делит total на n частей, каждая не меньше min.
+function split(total: number, n: number, min: number, rand: () => number): number[] {
+  if (n <= 0) return [];
+  const parts = Array.from({ length: n }, () => min);
+  let left = total - min * n;
+  if (left < 0) {
+    const base = Math.floor(total / n);
+    const even = Array.from({ length: n }, () => base);
+    for (let i = 0; i < total - base * n; i++) even[i]++;
+    return even;
+  }
+  while (left-- > 0) parts[Math.floor(rand() * n)]++;
+  return parts;
+}
+
+// Правило перерыва: 45 минут сразу или 15 + потом 30. После такого перерыва
+// счётчик вождения обнуляется. Прочая работа перерывом не считается.
+function analyze(seq: Tok[]) {
+  let run = 0;
+  let maxRun = 0;
+  let pending = false;
+  let ok = true;
+  for (const s of seq) {
+    if (s.t === "D") {
+      run += s.u;
+      maxRun = Math.max(maxRun, run);
+      if (run > MAX_RUN) ok = false;
+    } else if (s.t === "P") {
+      if (s.u >= 3) {
+        run = 0;
+        pending = false;
+      } else if (pending && s.u >= 2) {
+        run = 0;
+        pending = false;
+      } else if (s.u >= 1) {
+        pending = true;
+      }
+    }
+  }
+  return { ok, maxRun };
+}
+
+// Запасной вариант, когда вождения почти нет: работа по краям.
+function buildFlat(driveU: number, pauseU: number, workU: number, rand: () => number): { seq: Tok[]; drives: number[] } {
+  // 2 или 3 периода вождения; один — только если вождения совсем мало
+  let n = driveU === 0 ? 0 : driveU < 4 ? 1 : Math.max(2, Math.ceil(driveU / MAX_RUN));
+  if (n === 2 && driveU >= 24 && rand() < 0.4) n = 3;
+  n = Math.min(n, pauseU + 1);
+  if (driveU > 0 && n < 1) n = 1;
+
+  const pauses = n > 1 ? split(pauseU, n - 1, 1, rand) : [];
+  const blocks = n > 0 ? split(driveU, n, Math.min(4, Math.floor(driveU / n)), rand) : [];
+
+  // час прочей работы: 2–3 куска по 15 минут и кратно
+  let wantW = workU > 0 ? Math.min(workU, n >= 3 || rand() < 0.35 ? 3 : 2) : 0;
+  if (n < 2) wantW = Math.min(wantW, 2);
+  const wparts = wantW ? split(workU, wantW, 1, rand) : [];
+  const wa = wparts[0] ?? 0;
+  const we = wparts.length > 1 ? wparts[wparts.length - 1] : 0;
+  const wm = wparts.length > 2 ? wparts[1] : 0;
+  const mi = n > 1 ? Math.floor(rand() * (n - 1)) : 0;
+  const before = rand() < 0.5;
+
+  const seq: Tok[] = [];
+  const add = (t: Tok["t"], u: number) => u > 0 && seq.push({ t, u });
+  add("W", wa);
+  for (let i = 0; i < n; i++) {
+    add("D", blocks[i]);
+    if (i < n - 1) {
+      if (wm && i === mi && before) add("W", wm);
+      add("P", pauses[i]);
+      if (wm && i === mi && !before) add("W", wm);
+    }
+  }
+  if (n <= 1) add("P", pauseU);
+  add("W", we);
+  return { seq, drives: blocks };
+}
+
+function shuffle<T>(arr: T[], rand: () => number): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// День начинается и заканчивается ездой: сначала короткий отрезок (15, 30
+// или 60 минут), потом работа. Работа и перерывы стоят между отрезками
+// вождения. Редко (примерно 1 день из 8) день начинается или кончается работой.
+function build(
+  driveU: number,
+  pauseU: number,
+  workU: number,
+  rand: () => number,
+  attempt: number,
+): { seq: Tok[]; drives: number[] } {
+  if (driveU < 2) return buildFlat(driveU, pauseU, workU, rand);
+
+  let n = Math.max(2, Math.ceil(driveU / MAX_RUN));
+  if (driveU >= 12 && rand() < 0.4) n++;
+  if (attempt > 150) n++;
+  n = Math.min(n, 4, driveU);
+
+  const firstOpts = [1, 2, 4, 4].filter((x) => x <= driveU - (n - 1));
+  const firstLen = firstOpts.length ? firstOpts[Math.floor(rand() * firstOpts.length)] : 1;
+  const rem = driveU - firstLen;
+  const rest = split(rem, n - 1, Math.min(4, Math.floor(rem / (n - 1))), rand);
+  const blocks = [firstLen, ...rest];
+
+  // кусочки часа прочей работы: 2–3 по 15 минут и кратно
+  const k = workU >= 3 && rand() < 0.45 ? 3 : Math.min(2, workU);
+  const parts = k > 0 ? split(workU, k, 1, rand) : [];
+  let startW = 0;
+  let endW = 0;
+  if (parts.length >= 2) {
+    const r = rand();
+    if (r < 0.06) startW = parts.pop()!;
+    else if (r < 0.12) endW = parts.pop()!;
+  }
+
+  const gaps: Tok[][] = Array.from({ length: n - 1 }, () => []);
+  if (parts.length) gaps[0].push({ t: "W", u: parts[0] });
+  for (let i = 1; i < parts.length; i++) gaps[Math.floor(rand() * gaps.length)].push({ t: "W", u: parts[i] });
+
+  if (pauseU > 0) {
+    const m = 1 + Math.floor(rand() * Math.min(n - 1, pauseU));
+    const amounts = split(pauseU, m, 1, rand);
+    const where = shuffle(Array.from({ length: n - 1 }, (_, i) => i), rand).slice(0, m);
+    where.forEach((g, i) => gaps[g].push({ t: "P", u: amounts[i] }));
+  }
+
+  const seq: Tok[] = [];
+  const add = (tok: Tok) => {
+    const prev = seq[seq.length - 1];
+    if (prev && prev.t === tok.t) prev.u += tok.u;
+    else seq.push({ ...tok });
+  };
+  if (startW) add({ t: "W", u: startW });
+  blocks.forEach((b, i) => {
+    add({ t: "D", u: b });
+    if (i < n - 1) {
+      const items = gaps[i];
+      const head = i === 0 && parts.length ? items.slice(0, 1) : [];
+      const tail = shuffle(items.slice(head.length), rand);
+      [...head, ...tail].forEach(add);
+    }
+  });
+  if (endW) add({ t: "W", u: endW });
+  return { seq, drives: blocks };
+}
+
+function plan(driveU: number, pauseU: number, workU: number, rand: () => number) {
+  let last = build(driveU, pauseU, workU, rand, 0);
+  let a = analyze(last.seq);
+  for (let i = 1; i < 400 && !a.ok; i++) {
+    last = build(driveU, pauseU, workU, rand, i);
+    a = analyze(last.seq);
+  }
+  return { ...last, ...a };
+}
+
+const digits = (s: string) => Number(s.replace(/[^\d]/g, ""));
+
+// Делит пробег месяца по дням с вождением: примерно пропорционально часам,
+// но у каждого дня своё число, одинаковых в месяце нет. Сумма точная.
+function distributeKm(
+  rows: { iso: string; work: boolean; driveH: number }[],
+  total: number,
+  seed: number,
+): Record<string, number> {
+  const list = rows.filter((r) => r.work && r.driveH > 0);
+  if (total <= 0 || !list.length) return {};
+  const rand = rng(seed * 977 + 11);
+  const weights = list.map((r) => r.driveH * (0.8 + 0.4 * rand()));
+  const sumW = weights.reduce((s, w) => s + w, 0);
+  const vals = weights.map((w) => Math.max(1, Math.round((total * w) / sumW)));
+
+  const taken = new Set<number>();
+  vals.forEach((v, i) => {
+    let nv = v;
+    for (let d = 1; taken.has(nv); d++) nv = d % 2 ? v + (d + 1) / 2 : Math.max(1, v - d / 2);
+    vals[i] = nv;
+    taken.add(nv);
+  });
+
+  let diff = total - vals.reduce((s, v) => s + v, 0);
+  const step = diff > 0 ? 1 : -1;
+  for (let guard = 0; diff !== 0 && guard < 200000; guard++) {
+    const i = Math.floor(rand() * vals.length);
+    const nv = vals[i] + step;
+    if (nv < 1 || taken.has(nv)) continue;
+    taken.delete(vals[i]);
+    taken.add(nv);
+    vals[i] = nv;
+    diff -= step;
+  }
+  const out: Record<string, number> = {};
+  list.forEach((r, i) => (out[r.iso] = vals[i]));
+  return out;
+}
+
+export function computeTacho(input: BlankInput): TachoResult {
+  const { rows } = computeBlank(input);
+  const [firstName = "", ...rest] = input.name.trim().split(/\s+/).filter(Boolean);
+  const lastName = rest.join(" ");
+
+  const startText = (input.odoStart ?? "").replace(/[^\d]/g, "");
+  const endText = (input.odoEnd ?? "").replace(/[^\d]/g, "");
+  let odo = startText ? digits(startText) : NaN;
+  const hasOdo = Number.isFinite(odo);
+  const monthKm = startText && endText ? digits(endText) - digits(startText) : 0;
+  const kmByDay = distributeKm(rows, monthKm, input.seed);
+
+  let zip = input.startZip.trim();
+  const days: TachoDay[] = [];
+
+  for (const r of rows) {
+    const day: TachoDay = {
+      iso: r.iso,
+      day: r.day,
+      weekday: r.weekday,
+      work: r.work,
+      dateLabel: `${WD_DE[r.weekday]} ${String(r.day).padStart(2, "0")}.${input.monthNum}.${input.year}`,
+      from: zip,
+      to: zip,
+      kmStart: hasOdo ? String(odo) : "",
+      kmEnd: hasOdo ? String(odo) : "",
+      km: 0,
+      cells: Array.from({ length: UNITS }, () => "rest" as Kind),
+      vonU: 0,
+      endU: 0,
+      driveU: 0,
+      pauseU: 0,
+      drives: [],
+      maxRun: 0,
+      warnings: [],
+    };
+
+    if (r.work) {
+      const km = kmByDay[r.iso];
+      day.km = km ?? null;
+      if (hasOdo && km !== undefined) {
+        day.kmEnd = String(odo + km);
+        odo += km;
+      } else {
+        day.kmEnd = "";
+        day.kmStart = hasOdo ? String(odo) : "";
+      }
+      day.from = r.start || zip;
+      day.to = r.stop || day.from;
+      zip = day.to;
+
+      const vonU = Math.round(r.vonMin / 15);
+      const driveU = Math.round(r.driveH * 4);
+      const pauseU = Math.round(r.pauseH * 4);
+      const rand = rng(input.seed * 131 + r.day * 7919 + 17);
+      const p = plan(driveU, pauseU, WORK_HOUR, rand);
+
+      let pos = vonU;
+      for (const s of p.seq) {
+        const kind: Kind = s.t === "D" ? "drive" : s.t === "P" ? "rest" : "work";
+        for (let k = 0; k < s.u; k++, pos++) if (pos < UNITS) day.cells[pos] = kind;
+      }
+      Object.assign(day, { vonU, endU: pos, driveU, pauseU, drives: p.drives, maxRun: p.maxRun });
+
+      if (driveU > MAX_DAY_DRIVE) day.warnings.push(`вождение ${unitHM(driveU)} — больше 10 ч в день`);
+      if (!p.ok) day.warnings.push("нет положенного перерыва (45 мин после каждых 4:30 вождения) — увеличьте Pause в бланке");
+      if (pos > UNITS) day.warnings.push("смена выходит за полночь, лист обрезан");
+    }
+    days.push(day);
+  }
+
+  return {
+    firstName,
+    lastName,
+    plate: input.plate.trim(),
+    days,
+    driveU: days.reduce((s, d) => s + d.driveU, 0),
+    km: days.reduce((s, d) => s + (d.km ?? 0), 0),
+    warningCount: days.reduce((s, d) => s + d.warnings.length, 0),
+  };
+}
+
+
+==========================================================================
+FILE: client/lib/tachoDraw.ts
+==========================================================================
+import type { TachoDay, TachoResult } from "./tacho";
+
+// Рисуем листы Tageskontrollblatt на canvas (A4): четыре дня на лист.
+const W = 210;
+const H = 297;
+const LEFT = 10;
+const WIDTH = 190;
+const INK = "#1f3a3a";
+const GRID = "#6b7b7b";
+const FONT = "Georgia, 'Times New Roman', serif";
+const TOP = 8;
+const PITCH = 67;
+export const PER_PAGE = 4;
+
+export const pageCount = (days: number) => Math.max(1, Math.ceil(days / PER_PAGE));
+
+export function drawTachoPage(result: TachoResult, page: number, S: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = W * S;
+  canvas.height = H * S;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const lw = (mm: number) => (ctx.lineWidth = mm * S);
+  const text = (t: string, x: number, y: number, size: number, o: { bold?: boolean; align?: CanvasTextAlign } = {}) => {
+    ctx.font = `${o.bold ? "bold " : ""}${size * S}px ${FONT}`;
+    ctx.textAlign = o.align ?? "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = INK;
+    ctx.fillText(t, x * S, y * S);
+  };
+  const line = (x1: number, y1: number, x2: number, y2: number, w: number, color = INK) => {
+    ctx.strokeStyle = color;
+    lw(w);
+    ctx.beginPath();
+    ctx.moveTo(x1 * S, y1 * S);
+    ctx.lineTo(x2 * S, y2 * S);
+    ctx.stroke();
+  };
+  const box = (x: number, y: number, w: number, h: number, lwMm = 0.3) => {
+    ctx.strokeStyle = INK;
+    lw(lwMm);
+    ctx.strokeRect(x * S, y * S, w * S, h * S);
+  };
+
+  result.days.slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE).forEach((d, i) => {
+    block(d, TOP + i * PITCH);
+  });
+
+  // Номер листа Tacho, маленький, справа внизу
+  text(`${page + 1} / ${pageCount(result.days.length)}`, LEFT + WIDTH, H - 7, 3, { align: "right" });
+
+  // Легенда
+  const ly = TOP + 4 * PITCH + 3;
+  box(LEFT + 20, ly, 100, 13, 0.3);
+  text("1* = Lenkzeiten", LEFT + 22, ly + 2.8, 2.7, { bold: true });
+  text("2* = Ruhezeiten und Lenkzeitunterbrechung", LEFT + 22, ly + 6.5, 2.7, { bold: true });
+  text("3* = sonst. Arbeitszeiten einschl. Arbeitsbereitschaft", LEFT + 22, ly + 10.2, 2.7, { bold: true });
+
+  function block(d: TachoDay, y0: number) {
+    // Заголовок
+    box(LEFT, y0, WIDTH, 6.5, 0.4);
+    text("Tageskontrollblatt nach § 1 Abs.6 FPersV", LEFT + WIDTH / 2, y0 + 3.3, 4, { bold: true, align: "center" });
+
+    const rh = 5.5;
+    const y1 = y0 + 6.5;
+    const RX = LEFT + 130;
+    const LAB = 34;
+    const mid = (k: number) => y1 + k * rh + rh / 2;
+
+    // Левая часть
+    box(LEFT, y1, 65, rh);
+    box(LEFT + 65, y1, 65, rh);
+    box(LEFT, y1 + rh, 130, rh);
+    box(LEFT, y1 + 2 * rh, 130, rh);
+    box(LEFT, y1 + 3 * rh, 110, rh);
+    box(LEFT + 110, y1 + 3 * rh, 80, rh);
+    text("Name:", LEFT + 1.5, mid(0), 2.8, { bold: true });
+    text(result.lastName, LEFT + 13, mid(0), 3.3);
+    text("Vorname:", LEFT + 66.5, mid(0), 2.8, { bold: true });
+    text(result.firstName, LEFT + 82, mid(0), 3.3);
+    text("Amtl. Kennzeichen des (der) Fahrzeuge(s):", LEFT + 1.5, mid(1), 2.8, { bold: true });
+    text(result.plate, LEFT + 68, mid(1), 3.3);
+    text("Tag und Datum:", LEFT + 1.5, mid(2), 2.8, { bold: true });
+    text(d.dateLabel, LEFT + 30, mid(2), 3.3);
+    text("Ort der Fahrtaufnahme:", LEFT + 1.5, mid(3), 2.8, { bold: true });
+    text(d.from, LEFT + 40, mid(3), 3.3);
+    text("Ort der Fahrbeendigung:", LEFT + 111.5, mid(3), 2.8, { bold: true });
+    text(d.to, LEFT + 152, mid(3), 3.3);
+
+    // Правая часть: километры
+    const right: [string, string][] = [
+      ["Kilometerst. Fahrtende:", d.kmEnd],
+      ["Kilometerst. Fahrtbeginn:", d.kmStart],
+      ["Gesamtfahrstrecke:", d.km === null ? "" : `${d.km} km`],
+    ];
+    right.forEach(([label, value], k) => {
+      box(RX, y1 + k * rh, LAB, rh);
+      box(RX + LAB, y1 + k * rh, 60 - LAB, rh);
+      text(label, RX + 1, mid(k), 2.4, { bold: true });
+      text(value, RX + LAB + 1.5, mid(k), 3.2);
+    });
+
+    // Сетка времени
+    const y2 = y1 + 4 * rh;
+    const GX = LEFT + 8;
+    const GW = WIDTH - 8;
+    const hourW = GW / 12;
+    const cell = hourW / 4;
+    const rowH = 4.8;
+    const labelH = 4.2;
+    const halfH = labelH + 3 * rowH;
+
+    for (let half = 0; half < 2; half++) {
+      const ly0 = y2 + half * halfH;
+      const gy = ly0 + labelH;
+
+      // закрашенные клетки
+      for (let c = 0; c < 48; c++) {
+        const kind = d.cells[half * 48 + c];
+        const row = kind === "drive" ? 0 : kind === "rest" ? 1 : 2;
+        ctx.fillStyle = INK;
+        ctx.fillRect(GX * S + c * cell * S, (gy + row * rowH) * S, cell * S, rowH * S);
+      }
+      // линии клеток, часов и строк
+      for (let c = 0; c <= 48; c++) {
+        const x = GX + c * cell;
+        const hour = c % 4 === 0;
+        line(x, gy, x, gy + 3 * rowH, hour ? 0.35 : 0.12, hour ? INK : GRID);
+      }
+      for (let r = 0; r <= 3; r++) line(GX, gy + r * rowH, GX + GW, gy + r * rowH, 0.3);
+      // подписи часов
+      for (let h = 0; h <= 12; h++) {
+        text(String(half * 12 + h), GX + h * hourW, ly0 + labelH / 2, 3.1, { align: "center" });
+      }
+      // колонка значков
+      for (let r = 0; r < 3; r++) {
+        const y = gy + r * rowH;
+        box(LEFT, y, 8, rowH);
+        icon(r, LEFT + 4, y + rowH / 2);
+        if (half === 0) text(`${r + 1}*`, LEFT - 1, y + rowH / 2, 2.6, { align: "right" });
+      }
+      box(GX, gy, GW, 3 * rowH, 0.4);
+    }
+  }
+
+  function icon(r: number, cx: number, cy: number) {
+    ctx.strokeStyle = INK;
+    lw(0.25);
+    if (r === 0) {
+      ctx.beginPath();
+      ctx.arc(cx * S, cy * S, 1.8 * S, 0, Math.PI * 2);
+      ctx.stroke();
+      line(cx - 1.8, cy, cx + 1.8, cy, 0.25);
+      line(cx, cy - 1.8, cx, cy + 0.2, 0.25);
+    } else if (r === 1) {
+      ctx.fillStyle = INK;
+      ctx.fillRect((cx - 3) * S, (cy + 0.3) * S, 6 * S, 1.1 * S);
+      ctx.fillRect((cx - 3) * S, (cy - 1.4) * S, 1 * S, 2.8 * S);
+      ctx.fillRect((cx - 1.8) * S, (cy - 0.8) * S, 2 * S, 1 * S);
+    } else {
+      ctx.strokeRect((cx - 1.8) * S, (cy - 1.6) * S, 3.6 * S, 3.2 * S);
+      line(cx - 1.8, cy + 1.6, cx + 1.8, cy - 1.6, 0.25);
+    }
+  }
+
+  return canvas;
+}
+
+// PDF из нескольких листов A4, по одной картинке на лист, без внешних библиотек.
+export async function canvasesToPdf(canvases: HTMLCanvasElement[]): Promise<Blob> {
+  const jpgs = await Promise.all(
+    canvases.map(async (canvas) => {
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("canvas"))), "image/jpeg", 0.93),
+      );
+      return new Uint8Array(await blob.arrayBuffer());
+    }),
+  );
+  const enc = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  const offsets: number[] = [];
+  let offset = 0;
+  const push = (d: string | Uint8Array) => {
+    const b = typeof d === "string" ? enc.encode(d) : d;
+    chunks.push(b);
+    offset += b.length;
+  };
+  const obj = (n: number, body: string) => {
+    offsets[n] = offset;
+    push(`${n} 0 obj\n${body}\nendobj\n`);
+  };
+
+  const n = canvases.length;
+  const kids = canvases.map((_, i) => `${3 + 3 * i} 0 R`).join(" ");
+  push("%PDF-1.4\n");
+  obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+  obj(2, `<< /Type /Pages /Kids [${kids}] /Count ${n} >>`);
+  canvases.forEach((canvas, i) => {
+    const pageId = 3 + 3 * i;
+    const imgId = pageId + 1;
+    const contId = pageId + 2;
+    obj(pageId, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /XObject << /Im${i} ${imgId} 0 R >> >> /Contents ${contId} 0 R >>`);
+    offsets[imgId] = offset;
+    push(
+      `${imgId} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${canvas.width} /Height ${canvas.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpgs[i].length} >>\nstream\n`,
+    );
+    push(jpgs[i]);
+    push("\nendstream\nendobj\n");
+    const content = `q 595.28 0 0 841.89 0 0 cm /Im${i} Do Q`;
+    obj(contId, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  });
+  const size = 3 + 3 * n;
+  const xref = offset;
+  let table = `xref\n0 ${size}\n0000000000 65535 f \n`;
+  for (let k = 1; k < size; k++) table += `${String(offsets[k]).padStart(10, "0")} 00000 n \n`;
+  push(`${table}trailer\n<< /Size ${size} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(chunks as BlobPart[], { type: "application/pdf" });
+}
+
+
+==========================================================================
+FILE: client/lib/pdf.ts
+==========================================================================
+import { MONTHS_DE, fmtHM, fmtNum, type BlankInput, type BlankRow, type BlankTotals } from "./blank";
+
+// Рисуем бланк на canvas (A4, 10 px на мм) и кладём картинку в PDF.
+const S = 10;
+const W = 210;
+const H = 297;
+const LEFT = 10;
+const INK = "#1f3a3a";
+const FONT = "Arial, Helvetica, sans-serif";
+
+type Key = keyof BlankRow;
+const COLS: { key: Key; w: number; label: string[] }[] = [
+  { key: "day", w: 10, label: ["Datum"] },
+  { key: "von", w: 14, label: ["von"] },
+  { key: "bis", w: 14, label: ["bis"] },
+  { key: "zeit", w: 11, label: ["Zeit"] },
+  { key: "spesen", w: 15, label: ["Spesen"] },
+  { key: "start", w: 20, label: ["Start"] },
+  { key: "stop", w: 20, label: ["Stop"] },
+  { key: "pvon", w: 14, label: ["von"] },
+  { key: "pause", w: 12, label: ["Pause"] },
+  { key: "pbis", w: 14, label: ["bis"] },
+  { key: "arb", w: 23, label: ["Netto", "Arb.Zeit"] },
+  { key: "fahr", w: 23, label: ["Netto", "Fahrzeit"] },
+];
+
+export function drawBlank(input: BlankInput, rows: BlankRow[], totals: BlankTotals): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = W * S;
+  canvas.height = H * S;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = INK;
+  ctx.fillStyle = INK;
+  ctx.lineWidth = 0.3 * S;
+
+  const text = (t: string, x: number, y: number, size: number, opts: { bold?: boolean; align?: CanvasTextAlign } = {}) => {
+    ctx.font = `${opts.bold ? "bold " : ""}${size * S}px ${FONT}`;
+    ctx.textAlign = opts.align ?? "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = INK;
+    ctx.fillText(t, x * S, y * S);
+  };
+  const line = (x1: number, y1: number, x2: number, y2: number) => {
+    ctx.beginPath();
+    ctx.moveTo(x1 * S, y1 * S);
+    ctx.lineTo(x2 * S, y2 * S);
+    ctx.stroke();
+  };
+  const box = (x: number, y: number, w: number, h: number) => ctx.strokeRect(x * S, y * S, w * S, h * S);
+
+  // Заголовок
+  box(LEFT, 8, 190, 9);
+  text("Spesen und Arbeitszeiten", W / 2, 12.7, 5.2, { bold: true, align: "center" });
+
+  // Name / Kennz / Monat
+  const monthName = MONTHS_DE[Number(input.monthNum) - 1] ?? "";
+  text("Name:", LEFT, 28, 3.8, { bold: true });
+  text(input.name, LEFT + 14, 27.6, 3.6);
+  line(LEFT, 29.5, 100, 29.5);
+  text("Kennz:", 105, 28, 3.8, { bold: true });
+  text(input.plate, 105 + 15, 27.6, 3.6);
+  line(105, 29.5, 150, 29.5);
+  text("Monat:", 155, 28, 3.8, { bold: true });
+  text(`${monthName} ${input.year}`, 155 + 15, 27.6, 3.4);
+  line(155, 29.5, 200, 29.5);
+
+  // Группы Spesen / Stunden
+  const gy = 34;
+  const gh = 7;
+  const xs: number[] = [];
+  let x = LEFT;
+  for (const c of COLS) {
+    xs.push(x);
+    x += c.w;
+  }
+  box(LEFT, gy, 10, gh);
+  box(xs[1], gy, xs[6] - xs[1], gh);
+  box(xs[6], gy, LEFT + 190 - xs[6], gh);
+  text("Spesen", xs[1] + 3, gy + gh / 2, 3.6, { bold: true });
+  text("Stunden", xs[6] + 3, gy + gh / 2, 3.6, { bold: true });
+
+  // Шапка колонок
+  const hy = 43;
+  const hh = 8;
+  const ry = hy + hh;
+  const rh = 7.2;
+  COLS.forEach((c, i) => {
+    box(xs[i], hy, c.w, hh);
+    if (c.label.length === 1) {
+      text(c.label[0], xs[i] + c.w / 2, hy + hh / 2, 2.7, { bold: true, align: "center" });
+    } else {
+      text(c.label[0], xs[i] + c.w / 2, hy + hh / 2 - 1.8, 2.5, { bold: true, align: "center" });
+      text(c.label[1], xs[i] + c.w / 2, hy + hh / 2 + 1.8, 2.5, { bold: true, align: "center" });
+    }
+  });
+
+  // Строки
+  const spesenX = xs[4];
+  const totalRows = 31;
+  for (let i = 0; i < totalRows; i++) {
+    const y = ry + i * rh;
+    const r = rows[i];
+    if (r && !r.work) {
+      ctx.fillStyle = "#ececec";
+      ctx.fillRect(LEFT * S, y * S, 190 * S, rh * S);
+    }
+    ctx.fillStyle = "#f3b46b";
+    ctx.fillRect(spesenX * S, y * S, COLS[4].w * S, rh * S);
+    COLS.forEach((c, ci) => {
+      box(xs[ci], y, c.w, rh);
+      if (!r) return;
+      const v = c.key === "day" ? String(r.day) : String(r[c.key] ?? "");
+      if (!v) return;
+      if (c.key === "day") text(v, xs[ci] + 1.5, y + rh / 2, 3.2, { bold: true });
+      else text(v, xs[ci] + c.w / 2, y + rh / 2, 3.2, { align: "center" });
+    });
+  }
+
+  // Итоги
+  const ty = ry + totalRows * rh;
+  COLS.forEach((c, ci) => {
+    if (ci === 4) {
+      ctx.fillStyle = "#f3b46b";
+      ctx.fillRect(xs[ci] * S, ty * S, c.w * S, rh * S);
+    }
+    box(xs[ci], ty, c.w, rh);
+  });
+  text(fmtNum(totals.spesen), xs[4] + COLS[4].w / 2, ty + rh / 2, 3.4, { bold: true, align: "center" });
+  text(fmtHM(totals.arb), xs[10] + COLS[10].w / 2, ty + rh / 2, 3.4, { bold: true, align: "center" });
+  text(fmtHM(totals.fahr), xs[11] + COLS[11].w / 2, ty + rh / 2, 3.4, { bold: true, align: "center" });
+
+  return canvas;
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+
+==========================================================================
+FILE: client/lib/combinedPdf.ts
+==========================================================================
+import { computeBlank, type BlankInput } from "./blank";
+import { drawBlank, downloadBlob } from "./pdf";
+import { computeTacho } from "./tacho";
+import { canvasesToPdf, drawTachoPage, pageCount } from "./tachoDraw";
+
+// Один PDF: первая страница — Spesen und Arbeitszeiten, дальше листы Tageskontrollblatt.
+export async function downloadCombinedPdf(form: BlankInput) {
+  const { rows, totals } = computeBlank(form);
+  const tacho = computeTacho(form);
+  const canvases = [
+    drawBlank(form, rows, totals),
+    ...Array.from({ length: pageCount(tacho.days.length) }, (_, p) => drawTachoPage(tacho, p, 8)),
+  ];
+  const pdf = await canvasesToPdf(canvases);
+  const who = (form.name.trim() || "Spesen").replace(/\s+/g, "_");
+  downloadBlob(pdf, `Spesen_Tacho_${who}_${form.year}-${form.monthNum}.pdf`);
+}
+
+
+==========================================================================
+FILE: client/lib/useBlankForm.ts
+==========================================================================
+import { useEffect, useState } from "react";
+import type { BlankInput } from "./blank";
+
+// Одно состояние на два листа: бланк Spesen и Tageskontrollblatt.
+const STORAGE_KEY = "timesheets-blank-v1";
+
+// Пустой бланк текущего месяца.
+export function emptyState(): BlankInput {
+  const now = new Date();
+  return {
+    name: "",
+    plate: "",
+    year: String(now.getFullYear()),
+    monthNum: String(now.getMonth() + 1).padStart(2, "0"),
+    monthDrive: "",
+    seed: Math.floor(Math.random() * 1_000_000),
+    startZip: "",
+    stops: {},
+    off: {},
+    on: {},
+    edits: {},
+    odoStart: "",
+    odoEnd: "",
+  };
+}
+
+function initialState(): BlankInput {
+  const base = emptyState();
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) return { ...base, ...JSON.parse(saved) };
+  } catch {
+    // нет доступа к хранилищу — начинаем с пустого бланка
+  }
+  return base;
+}
+
+export function useBlankForm() {
+  const [form, setForm] = useState<BlankInput>(initialState);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(form));
+    } catch {
+      // ignore
+    }
+  }, [form]);
+  return [form, setForm] as const;
+}
+
+
+==========================================================================
+FILE: client/lib/EditCell.tsx
+(использует компоненты Input, Button, Checkbox — замените своими)
+==========================================================================
+import React, { createContext, useContext, useState } from "react";
+import { RotateCcw } from "lucide-react";
+import { Input } from "../components/Input";
+import { Button } from "../components/Button";
+import { Checkbox } from "../components/Checkbox";
+import { WEEKDAYS_RU, type BlankRow, type FieldKey } from "./blank";
+
+export interface BlankActions {
+  edit: (iso: string, field: FieldKey, raw: string) => void;
+  reset: (iso: string) => void;
+  setWork: (iso: string, work: boolean) => void;
+}
+
+export const BlankContext = createContext<BlankActions>({
+  edit: () => {},
+  reset: () => {},
+  setWork: () => {},
+});
+
+const WIDTH: Partial<Record<FieldKey, string>> = {
+  von: "w-[4.5rem]", bis: "w-[4.5rem]", pvon: "w-[4.5rem]", pbis: "w-[4.5rem]",
+  zeit: "w-14", spesen: "w-14", pause: "w-14", arb: "w-16", fahr: "w-16",
+  start: "w-24", stop: "w-24",
+};
+
+// Поле коммитится при выходе из него или по Enter, чтобы пересчёт
+// не мешал печатать.
+export function EditCell({ row, field }: { row: BlankRow; field: FieldKey }) {
+  const { edit } = useContext(BlankContext);
+  const [draft, setDraft] = useState<string | null>(null);
+  if (!row.work) return <span className="block h-8" />;
+  const shown = String(row[field] ?? "");
+  const commit = () => {
+    if (draft !== null && draft !== shown) edit(row.iso, field, draft);
+    setDraft(null);
+  };
+  return (
+    <Input
+      size="sm"
+      className={`${WIDTH[field] ?? "w-16"} px-1 text-center`}
+      aria-label={`${field} ${row.iso}`}
+      value={draft ?? shown}
+      onFocus={(e) => {
+        setDraft(shown);
+        e.currentTarget.select();
+      }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") {
+          setDraft(null);
+          e.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+export function DayLabel({ row }: { row: BlankRow }) {
+  return (
+    <span className={row.work ? "text-sm font-medium" : "text-sm text-tertiary"}>
+      {WEEKDAYS_RU[row.weekday]} {String(row.day).padStart(2, "0")}
+    </span>
+  );
+}
+
+export function WorkToggle({ row }: { row: BlankRow }) {
+  const { setWork } = useContext(BlankContext);
+  return (
+    <Checkbox
+      aria-label={`Рабочий день ${row.iso}`}
+      checked={row.work}
+      onCheckedChange={(v) => setWork(row.iso, v === true)}
+    />
+  );
+}
+
+export function ResetButton({ row }: { row: BlankRow }) {
+  const { reset } = useContext(BlankContext);
+  if (!row.edited || !row.work) return <span className="block size-8" />;
+  return (
+    <Button size="icon" variant="tertiary" aria-label="Сбросить день" onClick={() => reset(row.iso)}>
+      <RotateCcw />
+    </Button>
+  );
+}
+
+
+==========================================================================
+FILE: client/lib/ClearButton.tsx
+(использует Button, Dialog, Toast — замените своими)
+==========================================================================
+import React, { useState } from "react";
+import { Trash2 } from "lucide-react";
+import { Button } from "../components/Button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "../components/Dialog";
+import { toast } from "../components/Toast";
+import { emptyState } from "./useBlankForm";
+import type { BlankInput } from "./blank";
+
+// Очищает всё: имя, номер, индексы, пробег, часы и все правки по дням.
+export function ClearButton({ onClear }: { onClear: (next: BlankInput) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="secondary">
+          <Trash2 /> Очистить всё
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Очистить всё?</DialogTitle>
+          <DialogDescription>
+            Исчезнут имя, номер машины, индексы, пробег, часы и все ручные правки по дням — и в бланке, и в Tacho.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="secondary" onClick={() => setOpen(false)}>
+            Отмена
+          </Button>
+          <Button
+            onClick={() => {
+              onClear(emptyState());
+              setOpen(false);
+              toast.success("Всё очищено");
+            }}
+          >
+            Очистить
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+==========================================================================
+FILE: client/lib/offline.ts
+(работа без интернета; вместе с server.ts. Токены toast замените своими)
+==========================================================================
+import { toast } from "../components/Toast";
+
+const CACHE = "blank-taho-v1";
+const FLAG = "timesheets-offline-ready";
+const SKIP = ["/app-api/", "/__g3/live", "/__g3/session", "/__g3/refresh"];
+
+// Подключает работу без интернета: после первой загрузки всё нужное
+// (страница, скрипты, значки) сохраняется на телефоне.
+export function enableOffline() {
+  if (!("serviceWorker" in navigator) || !("caches" in window)) return;
+
+  const run = async () => {
+    try {
+      await navigator.serviceWorker.register("/app-api/sw.js", { scope: "/" });
+      await navigator.serviceWorker.ready;
+      await new Promise((r) => setTimeout(r, 2500)); // даём догрузиться остальному
+
+      const cache = await caches.open(CACHE);
+      const urls = new Set<string>(["/manifest.webmanifest"]);
+      for (const e of performance.getEntriesByType("resource")) {
+        const u = new URL(e.name);
+        if (u.origin === location.origin && SKIP.some((p) => u.pathname.startsWith(p))) continue;
+        if (u.protocol === "http:" || u.protocol === "https:") urls.add(e.name);
+      }
+      await Promise.all(
+        [...urls].map(async (u) => {
+          try {
+            if (await cache.match(u)) return;
+            if (new URL(u, location.href).origin === location.origin) {
+              const res = await fetch(u);
+              if (res.ok) await cache.put(u, res);
+            } else {
+              await cache.put(u, await fetch(u, { mode: "no-cors" }));
+            }
+          } catch {
+            // не удалось сохранить один файл — остальные всё равно сохранятся
+          }
+        }),
+      );
+
+      // сама страница с приложением
+      const page = await fetch(location.pathname, { headers: { accept: "text/html" } });
+      if (page.ok && !page.redirected) {
+        const text = await page.text();
+        if (text.includes("mountGlideApp")) {
+          await cache.put("/shell", new Response(text, { headers: { "content-type": "text/html; charset=utf-8" } }));
+          if (!localStorage.getItem(FLAG)) {
+            localStorage.setItem(FLAG, "1");
+            toast.success("Приложение готово работать без интернета");
+          }
+        }
+      }
+    } catch {
+      // без service worker приложение работает как обычно, только с интернетом
+    }
+  };
+
+  if (document.readyState === "complete") run();
+  else window.addEventListener("load", run, { once: true });
+}
+// ПРИМЕЧАНИЕ: проверка "mountGlideApp" относится к платформе Glide. В своём проекте
+// замените её на любую метку вашей HTML-страницы, например "id=\"root\"".
+
+
+==========================================================================
+FILE: client/pages/Generator.tsx
+(страница «Бланк»; использует компоненты интерфейса — замените своими)
+==========================================================================
+import React, { useMemo, useState } from "react";
+import { useBlankForm } from "../lib/useBlankForm";
+import { ClearButton } from "../lib/ClearButton";
+import type { ColumnDef } from "@tanstack/react-table";
+import { FileDown, Shuffle } from "lucide-react";
+import { PageHeader } from "../components/PageHeader";
+import { Button } from "../components/Button";
+import { Card } from "../components/Card";
+import { Input } from "../components/Input";
+import { Label } from "../components/Label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
+import { DataTable } from "../components/DataTable";
+import { Stat } from "../components/Stat";
+import { toast } from "../components/Toast";
+import {
+  MONTHS_RU,
+  applyEdit,
+  computeBlank,
+  fmtHM,
+  fmtNum,
+  resetDay,
+  type BlankInput,
+  type BlankRow,
+  type FieldKey,
+} from "../lib/blank";
+import {
+  BlankContext,
+  DayLabel,
+  EditCell,
+  ResetButton,
+  WorkToggle,
+  type BlankActions,
+} from "../lib/EditCell";
+import { downloadCombinedPdf } from "../lib/combinedPdf";
+
+const field = (key: FieldKey, header: string): ColumnDef<BlankRow, unknown> => ({
+  id: key,
+  header,
+  enableSorting: false,
+  cell: ({ row }) => <EditCell row={row.original} field={key} />,
+});
+
+const COLUMNS: ColumnDef<BlankRow, unknown>[] = [
+  { id: "day", header: "Datum", enableSorting: false, cell: ({ row }) => <DayLabel row={row.original} /> },
+  { id: "work", header: "Работа", enableSorting: false, cell: ({ row }) => <WorkToggle row={row.original} /> },
+  field("von", "von"),
+  field("bis", "bis"),
+  field("zeit", "Zeit"),
+  field("spesen", "Spesen"),
+  field("start", "Start"),
+  field("stop", "Stop"),
+  field("pvon", "von"),
+  field("pause", "Pause"),
+  field("pbis", "bis"),
+  field("arb", "Netto Arb.Zeit"),
+  field("fahr", "Netto Fahrzeit"),
+  { id: "reset", header: "", enableSorting: false, cell: ({ row }) => <ResetButton row={row.original} /> },
+];
+
+export default function Generator() {
+  const [form, setForm] = useBlankForm();
+  const [busy, setBusy] = useState(false);
+
+  const { rows, totals } = useMemo(() => computeBlank(form), [form]);
+  const set = <K extends keyof BlankInput>(key: K, value: BlankInput[K]) =>
+    setForm((f) => ({ ...f, [key]: value }));
+  const actions = useMemo<BlankActions>(
+    () => ({
+      edit: (iso, key, raw) =>
+        setForm((f) => {
+          const row = computeBlank(f).rows.find((r) => r.iso === iso);
+          return row ? applyEdit(f, row, key, raw) : f;
+        }),
+      reset: (iso) => setForm((f) => resetDay(f, iso)),
+      setWork: (iso, work) =>
+        setForm((f) => {
+          const wd = new Date(`${iso}T12:00:00`).getDay();
+          return wd === 0 || wd === 6
+            ? { ...f, on: { ...f.on, [iso]: work } }
+            : { ...f, off: { ...f.off, [iso]: !work } };
+        }),
+    }),
+    [],
+  );
+  const years = Array.from({ length: 5 }, (_, i) => String(new Date().getFullYear() - 2 + i));
+
+  const download = async () => {
+    setBusy(true);
+    try {
+      await downloadCombinedPdf(form);
+      toast.success("PDF готов: бланк и Tacho");
+    } catch {
+      toast.error("Не удалось создать PDF");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="Бланк Spesen und Arbeitszeiten"
+        actions={
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
+              <ClearButton onClear={setForm} />
+              <Button variant="secondary" onClick={() => set("seed", Math.floor(Math.random() * 1_000_000))}>
+                <Shuffle /> Перемешать
+              </Button>
+            </div>
+            <Button isLoading={busy} onClick={download}>
+              <FileDown /> Скачать PDF (бланк + Tacho)
+            </Button>
+          </div>
+        }
+      />
+
+      <Card>
+        <h3 className="text-base font-semibold">Заполните один раз</h3>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
+          <div className="space-y-2">
+            <Label htmlFor="name">Имя и фамилия (Name)</Label>
+            <Input id="name" value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="Иван Петров" />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="plate">Номер машины (Kennz)</Label>
+            <Input id="plate" value={form.plate} onChange={(e) => set("plate", e.target.value)} placeholder="M-AB 1234" />
+          </div>
+          <div className="space-y-2">
+            <Label>Месяц (Monat)</Label>
+            <div className="flex gap-2">
+              <Select value={form.monthNum} onValueChange={(v) => set("monthNum", v)}>
+                <SelectTrigger aria-label="Месяц">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {MONTHS_RU.map((m, i) => (
+                    <SelectItem key={m} value={String(i + 1).padStart(2, "0")}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={form.year} onValueChange={(v) => set("year", v)}>
+                <SelectTrigger aria-label="Год" className="w-auto shrink-0">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {years.map((y) => (
+                    <SelectItem key={y} value={y}>
+                      {y}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="drive">Время в пути за месяц, ч (сумма Netto Fahrzeit)</Label>
+            <Input id="drive" value={form.monthDrive} onChange={(e) => set("monthDrive", e.target.value)} placeholder="150" inputMode="decimal" />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="startZip">Почтовый код старта (Start)</Label>
+            <Input id="startZip" value={form.startZip} onChange={(e) => set("startZip", e.target.value)} placeholder="80331" inputMode="numeric" />
+          </div>
+        </div>
+      </Card>
+
+      <section className="space-y-3">
+        <h3 className="text-base font-semibold">Бланк по дням</h3>
+        <p className="text-sm text-secondary">
+          Любое поле можно поправить: нажмите, впишите значение и нажмите Enter. Остальное в этом дне пересчитается, а оставшиеся часы месяца разойдутся по другим дням. Пустое поле возвращает автоматику. Чтобы сделать день нерабочим (отгул, больничный, отпуск), снимите галочку «Работа». Чтобы выйти в субботу или воскресенье, поставьте галочку в этой строке. Stop дня сам становится Start следующего.
+        </p>
+        <BlankContext.Provider value={actions}>
+          <DataTable columns={COLUMNS} data={rows} />
+        </BlankContext.Provider>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <Stat label="Итого Spesen" value={`${fmtNum(totals.spesen)} €`} />
+          <Stat label="Итого Netto Arb.Zeit" value={fmtHM(totals.arb)} />
+          <Stat label="Итого Netto Fahrzeit" value={fmtHM(totals.fahr)} />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+
+==========================================================================
+FILE: client/pages/Tacho.tsx
+(страница «Tacho»; использует компоненты интерфейса — замените своими)
+==========================================================================
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
+import type { ColumnDef } from "@tanstack/react-table";
+import { ChevronLeft, ChevronRight, FileDown } from "lucide-react";
+import { PageHeader } from "../components/PageHeader";
+import { Button } from "../components/Button";
+import { Card } from "../components/Card";
+import { Input } from "../components/Input";
+import { Label } from "../components/Label";
+import { Badge } from "../components/Badge";
+import { DataTable } from "../components/DataTable";
+import { DetailList, DetailItem } from "../components/DetailList";
+import { Stat } from "../components/Stat";
+import { toast } from "../components/Toast";
+import { MONTHS_RU } from "../lib/blank";
+import { computeTacho, unitHM, unitTime, type TachoDay } from "../lib/tacho";
+import { drawTachoPage, pageCount } from "../lib/tachoDraw";
+import { downloadCombinedPdf } from "../lib/combinedPdf";
+import { useBlankForm } from "../lib/useBlankForm";
+import { ClearButton } from "../lib/ClearButton";
+
+const COLUMNS: ColumnDef<TachoDay, unknown>[] = [
+  { id: "date", header: "Datum", enableSorting: false, cell: ({ row }) => row.original.dateLabel },
+  {
+    id: "shift",
+    header: "Смена",
+    enableSorting: false,
+    cell: ({ row }) => (row.original.work ? `${unitTime(row.original.vonU)}–${unitTime(row.original.endU)}` : "Выходной"),
+  },
+  {
+    id: "drives",
+    header: "Периоды вождения",
+    enableSorting: false,
+    cell: ({ row }) => row.original.drives.map(unitHM).join(" + ") || "—",
+  },
+  { id: "drive", header: "Lenkzeit", enableSorting: false, cell: ({ row }) => unitHM(row.original.driveU) },
+  {
+    id: "run",
+    header: "Макс. без перерыва",
+    enableSorting: false,
+    cell: ({ row }) => (row.original.work ? unitHM(row.original.maxRun) : "—"),
+  },
+  {
+    id: "zip",
+    header: "Start → Stop",
+    enableSorting: false,
+    cell: ({ row }) => (row.original.from || row.original.to ? `${row.original.from || "—"} → ${row.original.to || "—"}` : "—"),
+  },
+  { id: "km", header: "Км", enableSorting: false, cell: ({ row }) => row.original.km ?? "—" },
+  {
+    id: "check",
+    header: "Проверка",
+    enableSorting: false,
+    cell: ({ row }) =>
+      row.original.warnings.length ? <Badge tone="warning">Проверить</Badge> : <Badge tone="success">Ок</Badge>,
+  },
+];
+
+export default function Tacho() {
+  const [form, setForm] = useBlankForm();
+  const [page, setPage] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const host = useRef<HTMLDivElement>(null);
+
+  const result = useMemo(() => computeTacho(form), [form]);
+  const pages = pageCount(result.days.length);
+  const current = Math.min(page, pages - 1);
+
+  useEffect(() => {
+    const canvas = drawTachoPage(result, current, 5);
+    canvas.style.width = "100%";
+    canvas.style.height = "auto";
+    host.current?.replaceChildren(canvas);
+  }, [result, current]);
+
+  const set = (key: "odoStart" | "odoEnd", value: string) => setForm((f) => ({ ...f, [key]: value }));
+  const num = (s: string) => Number((s ?? "").replace(/[^\d]/g, "")) || 0;
+  const badRange = num(form.odoStart) > 0 && num(form.odoEnd) > 0 && num(form.odoEnd) <= num(form.odoStart);
+  const month = `${MONTHS_RU[Number(form.monthNum) - 1] ?? ""} ${form.year}`;
+  const issues = result.days.filter((d) => d.warnings.length);
+
+  const download = async () => {
+    setBusy(true);
+    try {
+      await downloadCombinedPdf(form);
+      toast.success("PDF готов: бланк и Tacho");
+    } catch {
+      toast.error("Не удалось создать PDF");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="Tageskontrollblatt"
+        actions={
+          <div className="flex flex-col items-end gap-2">
+            <ClearButton onClear={setForm} />
+            <Button isLoading={busy} onClick={download}>
+              <FileDown /> Скачать PDF (бланк + Tacho)
+            </Button>
+          </div>
+        }
+      />
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <DetailList title="Из бланка Spesen">
+          <DetailItem label="Имя (Vorname)">{result.firstName || "—"}</DetailItem>
+          <DetailItem label="Фамилия (Name)">{result.lastName || "—"}</DetailItem>
+          <DetailItem label="Номер машины">{result.plate || "—"}</DetailItem>
+          <DetailItem label="Месяц">{month}</DetailItem>
+          <DetailItem label="Почтовый код старта">{form.startZip || "—"}</DetailItem>
+        </DetailList>
+        <Card>
+          <h3 className="text-base font-semibold">Пробег</h3>
+          <div className="mt-4 space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="odo">Километраж на начало месяца, км</Label>
+              <Input id="odo" value={form.odoStart} onChange={(e) => set("odoStart", e.target.value)} placeholder="184500" inputMode="numeric" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="odoEnd">Километраж на конец месяца, км</Label>
+              <Input id="odoEnd" value={form.odoEnd} onChange={(e) => set("odoEnd", e.target.value)} placeholder="192000" inputMode="numeric" />
+              {badRange && <p className="text-sm text-error-ink">Конец месяца должен быть больше начала.</p>}
+            </div>
+          </div>
+        </Card>
+      </div>
+      <p className="text-sm text-secondary">
+        Время старта, конца, паузу и вождение лист берёт из <Link className="text-accent-ink underline" to="/">бланка Spesen</Link>. Имя, фамилию, номер, месяц и индекс старта меняйте там.
+      </p>
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+        <Stat label="Вождение за месяц" value={unitHM(result.driveU)} />
+        <Stat label="Пробег за месяц" value={result.km ? `${result.km} км` : "—"} />
+        <Stat
+          label="Замечания"
+          value={String(result.warningCount)}
+          context={result.warningCount ? "нужно проверить" : "всё по правилам"}
+        />
+      </div>
+
+      {issues.length > 0 && (
+        <Card>
+          <h3 className="text-base font-semibold">Что проверить</h3>
+          <ul className="mt-2 space-y-1 text-sm text-secondary">
+            {issues.map((d) => (
+              <li key={d.iso}>
+                {d.dateLabel}: {d.warnings.join("; ")}
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      <section className="space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-base font-semibold">Лист {current + 1} из {pages}</h3>
+          <div className="flex gap-2">
+            <Button variant="secondary" size="icon" aria-label="Предыдущий лист" disabled={current === 0} onClick={() => setPage(current - 1)}>
+              <ChevronLeft />
+            </Button>
+            <Button variant="secondary" size="icon" aria-label="Следующий лист" disabled={current >= pages - 1} onClick={() => setPage(current + 1)}>
+              <ChevronRight />
+            </Button>
+          </div>
+        </div>
+        <div className="mx-auto max-w-3xl overflow-hidden rounded-lg border border-border bg-raised">
+          <div ref={host} />
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h3 className="text-base font-semibold">Дни месяца</h3>
+        <DataTable columns={COLUMNS} data={result.days} />
+      </section>
+    </div>
+  );
+}
+
+
+==========================================================================
+FILE: client/App.tsx
+==========================================================================
+import React, { useEffect } from "react";
+import { BrowserRouter, Route as RouterRoute, Routes as RouterRoutes } from "react-router-dom";
+import { FileDownIcon, GaugeIcon } from "lucide-react";
+import Generator from "./pages/Generator";
+import Tacho from "./pages/Tacho";
+import { Nav } from "./components/Nav";
+import { Toaster } from "./components/Toast";
+import { enableOffline } from "./lib/offline";
+
+export default function App() {
+	useEffect(() => {
+		enableOffline();
+	}, []);
+	return (
+		<BrowserRouter>
+			<Nav
+				layout="top"
+				items={[
+					{ href: "/", label: "Бланк", icon: <FileDownIcon /> },
+					{ href: "/tacho", label: "Tacho", icon: <GaugeIcon /> },
+				]}
+			/>
+			<main className="mx-auto max-w-content px-4 pt-6 pb-8">
+				<RouterRoutes>
+					<RouterRoute path={"/"} element={<Generator />} />
+					<RouterRoute path={"/tacho"} element={<Tacho />} />
+					<RouterRoute path="*" element={<p className="py-16 text-center text-sm text-secondary">Такой страницы нет. <a className="text-accent-ink underline" href="/">На главную</a></p>} />
+				</RouterRoutes>
+			</main>
+			<Toaster />
+		</BrowserRouter>
+	);
+}
+
+
+==========================================================================
+FILE: server.ts
+(service worker для работы без интернета. В своём проекте отдавайте этот
+скрипт как обычный файл /sw.js из корня сайта и регистрируйте его оттуда)
+==========================================================================
+const CACHE = "blank-taho-v1";
+const SKIP = ["/app-api/", "/__g3/live", "/__g3/session", "/__g3/refresh"];
+
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) =>
+  e.waitUntil(
+    (async () => {
+      for (const k of await caches.keys()) if (k !== CACHE) await caches.delete(k);
+      await self.clients.claim();
+    })(),
+  ),
+);
+
+self.addEventListener("fetch", (e) => {
+  const req = e.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
+  if (url.origin === self.location.origin && SKIP.some((p) => url.pathname.startsWith(p))) return;
+  e.respondWith(req.mode === "navigate" ? page(req) : asset(req, e));
+});
+
+// Страница: сначала сеть, без сети — последняя сохранённая.
+async function page(req) {
+  const cache = await caches.open(CACHE);
+  try {
+    const res = await fetch(req);
+    if (res.ok && !res.redirected) {
+      const text = await res.clone().text();
+      if (text.includes("mountGlideApp")) await cache.put("/shell", new Response(text, { headers: { "content-type": "text/html; charset=utf-8" } }));
+    }
+    return res;
+  } catch (err) {
+    return (await cache.match("/shell")) || Response.error();
+  }
+}
+
+// Остальное: сразу из памяти, а свежее подтягивается в фоне.
+async function asset(req, e) {
+  const cache = await caches.open(CACHE);
+  const hit = await cache.match(req);
+  const net = fetch(req)
+    .then((res) => {
+      if (res && (res.ok || res.type === "opaque")) cache.put(req, res.clone());
+      return res;
+    })
+    .catch(() => null);
+  if (hit) {
+    e.waitUntil(net);
+    return hit;
+  }
+  return (await net) || Response.error();
+}
+
+// (конец файла)
